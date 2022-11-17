@@ -15,7 +15,6 @@
 package raft
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -24,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
@@ -50,34 +50,37 @@ func readyWithTimeout(n Node) Ready {
 // and other kinds of messages to recvc chan.
 func TestNodeStep(t *testing.T) {
 	for i, msgn := range raftpb.MessageType_name {
-		n := &node{
-			propc: make(chan msgWithResult, 1),
-			recvc: make(chan raftpb.Message, 1),
-		}
-		msgt := raftpb.MessageType(i)
-		n.Step(context.TODO(), raftpb.Message{Type: msgt})
-		// Proposal goes to proc chan. Others go to recvc chan.
-		if msgt == raftpb.MsgProp {
-			select {
-			case <-n.propc:
-			default:
-				t.Errorf("%d: cannot receive %s on propc chan", msgt, msgn)
+		t.Run(msgn, func(t *testing.T) {
+			n := &node{
+				propc: make(chan msgWithResult, 1),
+				recvc: make(chan raftpb.Message, 1),
 			}
-		} else {
-			if IsLocalMsg(msgt) {
+			msgt := raftpb.MessageType(i)
+			n.Step(context.TODO(), raftpb.Message{Type: msgt})
+			// Proposal goes to proc chan. Others go to recvc chan.
+			if msgt == raftpb.MsgProp {
 				select {
-				case <-n.recvc:
-					t.Errorf("%d: step should ignore %s", msgt, msgn)
+				case <-n.propc:
 				default:
+					t.Errorf("%d: cannot receive %s on propc chan", msgt, msgn)
 				}
 			} else {
-				select {
-				case <-n.recvc:
-				default:
-					t.Errorf("%d: cannot receive %s on recvc chan", msgt, msgn)
+				if IsLocalMsg(msgt) {
+					select {
+					case <-n.recvc:
+						t.Errorf("%d: step should ignore %s", msgt, msgn)
+					default:
+					}
+				} else {
+					select {
+					case <-n.recvc:
+					default:
+						t.Errorf("%d: cannot receive %s on recvc chan", msgt, msgn)
+					}
 				}
 			}
-		}
+		})
+
 	}
 }
 
@@ -101,29 +104,29 @@ func TestNodeStepUnblock(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		errc := make(chan error, 1)
-		go func() {
-			err := n.Step(ctx, raftpb.Message{Type: raftpb.MsgProp})
-			errc <- err
-		}()
-		tt.unblock()
-		select {
-		case err := <-errc:
-			if err != tt.werr {
-				t.Errorf("#%d: err = %v, want %v", i, err, tt.werr)
-			}
-			//clean up side-effect
-			if ctx.Err() != nil {
-				ctx = context.TODO()
-			}
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			errc := make(chan error, 1)
+			go func() {
+				err := n.Step(ctx, raftpb.Message{Type: raftpb.MsgProp})
+				errc <- err
+			}()
+			tt.unblock()
 			select {
-			case <-n.done:
-				n.done = make(chan struct{})
-			default:
+			case err := <-errc:
+				require.Equal(t, tt.werr, err)
+				//clean up side-effect
+				if ctx.Err() != nil {
+					ctx = context.TODO()
+				}
+				select {
+				case <-n.done:
+					n.done = make(chan struct{})
+				default:
+				}
+			case <-time.After(1 * time.Second):
+				t.Fatalf("#%d: failed to unblock step", i)
 			}
-		case <-time.After(1 * time.Second):
-			t.Fatalf("#%d: failed to unblock step", i)
-		}
+		})
 	}
 }
 
@@ -144,9 +147,7 @@ func TestNodePropose(t *testing.T) {
 	n := newNode(rn)
 	r := rn.raft
 	go n.run()
-	if err := n.Campaign(context.TODO()); err != nil {
-		t.Fatal(err)
-	}
+	require.Nil(t, n.Campaign(context.TODO()))
 	for {
 		rd := <-n.Ready()
 		s.Append(rd.Entries)
@@ -161,15 +162,9 @@ func TestNodePropose(t *testing.T) {
 	n.Propose(context.TODO(), []byte("somedata"))
 	n.Stop()
 
-	if len(msgs) != 1 {
-		t.Fatalf("len(msgs) = %d, want %d", len(msgs), 1)
-	}
-	if msgs[0].Type != raftpb.MsgProp {
-		t.Errorf("msg type = %d, want %d", msgs[0].Type, raftpb.MsgProp)
-	}
-	if !bytes.Equal(msgs[0].Entries[0].Data, []byte("somedata")) {
-		t.Errorf("data = %v, want %v", msgs[0].Entries[0].Data, []byte("somedata"))
-	}
+	require.Equal(t, 1, len(msgs))
+	require.Equal(t, raftpb.MsgProp, msgs[0].Type)
+	require.Equal(t, []byte("somedata"), msgs[0].Entries[0].Data)
 }
 
 // TestDisableProposalForwarding ensures that proposals are not forwarded to
@@ -191,17 +186,13 @@ func TestDisableProposalForwarding(t *testing.T) {
 	r2.Step(raftpb.Message{From: 2, To: 2, Type: raftpb.MsgProp, Entries: testEntries})
 
 	// verify r2(follower) does forward the proposal when DisableProposalForwarding is false
-	if len(r2.msgs) != 1 {
-		t.Fatalf("len(r2.msgs) expected 1, got %d", len(r2.msgs))
-	}
+	require.Equal(t, 1, len(r2.msgs))
 
 	// send proposal to r3(follower) where DisableProposalForwarding is true
 	r3.Step(raftpb.Message{From: 3, To: 3, Type: raftpb.MsgProp, Entries: testEntries})
 
 	// verify r3(follower) does not forward the proposal when DisableProposalForwarding is true
-	if len(r3.msgs) != 0 {
-		t.Fatalf("len(r3.msgs) expected 0, got %d", len(r3.msgs))
-	}
+	require.Zero(t, len(r3.msgs))
 }
 
 // TestNodeReadIndexToOldLeader ensures that raftpb.MsgReadIndex to old leader
@@ -222,25 +213,19 @@ func TestNodeReadIndexToOldLeader(t *testing.T) {
 	r2.Step(raftpb.Message{From: 2, To: 2, Type: raftpb.MsgReadIndex, Entries: testEntries})
 
 	// verify r2(follower) forwards this message to r1(leader) with term not set
-	if len(r2.msgs) != 1 {
-		t.Fatalf("len(r2.msgs) expected 1, got %d", len(r2.msgs))
-	}
+	require.Equal(t, 1, len(r2.msgs))
+
 	readIndxMsg1 := raftpb.Message{From: 2, To: 1, Type: raftpb.MsgReadIndex, Entries: testEntries}
-	if !reflect.DeepEqual(r2.msgs[0], readIndxMsg1) {
-		t.Fatalf("r2.msgs[0] expected %+v, got %+v", readIndxMsg1, r2.msgs[0])
-	}
+	require.Equal(t, readIndxMsg1, r2.msgs[0])
 
 	// send readindex request to r3(follower)
 	r3.Step(raftpb.Message{From: 3, To: 3, Type: raftpb.MsgReadIndex, Entries: testEntries})
 
 	// verify r3(follower) forwards this message to r1(leader) with term not set as well.
-	if len(r3.msgs) != 1 {
-		t.Fatalf("len(r3.msgs) expected 1, got %d", len(r3.msgs))
-	}
+	require.Equal(t, 1, len(r3.msgs))
+
 	readIndxMsg2 := raftpb.Message{From: 3, To: 1, Type: raftpb.MsgReadIndex, Entries: testEntries}
-	if !reflect.DeepEqual(r3.msgs[0], readIndxMsg2) {
-		t.Fatalf("r3.msgs[0] expected %+v, got %+v", readIndxMsg2, r3.msgs[0])
-	}
+	require.Equal(t, readIndxMsg2, r3.msgs[0])
 
 	// now elect r3 as leader
 	nt.send(raftpb.Message{From: 3, To: 3, Type: raftpb.MsgHup})
@@ -250,17 +235,13 @@ func TestNodeReadIndexToOldLeader(t *testing.T) {
 	r1.Step(readIndxMsg2)
 
 	// verify r1(follower) forwards these messages again to r3(new leader)
-	if len(r1.msgs) != 2 {
-		t.Fatalf("len(r1.msgs) expected 1, got %d", len(r1.msgs))
-	}
+	require.Equal(t, 2, len(r1.msgs))
+
 	readIndxMsg3 := raftpb.Message{From: 2, To: 3, Type: raftpb.MsgReadIndex, Entries: testEntries}
-	if !reflect.DeepEqual(r1.msgs[0], readIndxMsg3) {
-		t.Fatalf("r1.msgs[0] expected %+v, got %+v", readIndxMsg3, r1.msgs[0])
-	}
+	require.Equal(t, readIndxMsg3, r1.msgs[0])
+
 	readIndxMsg3 = raftpb.Message{From: 3, To: 3, Type: raftpb.MsgReadIndex, Entries: testEntries}
-	if !reflect.DeepEqual(r1.msgs[1], readIndxMsg3) {
-		t.Fatalf("r1.msgs[1] expected %+v, got %+v", readIndxMsg3, r1.msgs[1])
-	}
+	require.Equal(t, readIndxMsg3, r1.msgs[1])
 }
 
 // TestNodeProposeConfig ensures that node.ProposeConfChange sends the given configuration proposal
@@ -294,21 +275,14 @@ func TestNodeProposeConfig(t *testing.T) {
 	}
 	cc := raftpb.ConfChange{Type: raftpb.ConfChangeAddNode, NodeID: 1}
 	ccdata, err := cc.Marshal()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+
 	n.ProposeConfChange(context.TODO(), cc)
 	n.Stop()
 
-	if len(msgs) != 1 {
-		t.Fatalf("len(msgs) = %d, want %d", len(msgs), 1)
-	}
-	if msgs[0].Type != raftpb.MsgProp {
-		t.Errorf("msg type = %d, want %d", msgs[0].Type, raftpb.MsgProp)
-	}
-	if !bytes.Equal(msgs[0].Entries[0].Data, ccdata) {
-		t.Errorf("data = %v, want %v", msgs[0].Entries[0].Data, ccdata)
-	}
+	require.Equal(t, 1, len(msgs))
+	require.Equal(t, raftpb.MsgProp, msgs[0].Type)
+	require.Equal(t, ccdata, msgs[0].Entries[0].Data)
 }
 
 // TestNodeProposeAddDuplicateNode ensures that two proposes to add the same node should
@@ -378,15 +352,9 @@ func TestNodeProposeAddDuplicateNode(t *testing.T) {
 	cancel()
 	<-goroutineStopped
 
-	if len(allCommittedEntries) != 4 {
-		t.Errorf("len(entry) = %d, want %d, %v\n", len(allCommittedEntries), 4, allCommittedEntries)
-	}
-	if !bytes.Equal(allCommittedEntries[1].Data, ccdata1) {
-		t.Errorf("data = %v, want %v", allCommittedEntries[1].Data, ccdata1)
-	}
-	if !bytes.Equal(allCommittedEntries[3].Data, ccdata2) {
-		t.Errorf("data = %v, want %v", allCommittedEntries[3].Data, ccdata2)
-	}
+	require.Equal(t, 4, len(allCommittedEntries))
+	require.Equal(t, ccdata1, allCommittedEntries[1].Data)
+	require.Equal(t, ccdata2, allCommittedEntries[3].Data)
 }
 
 // TestBlockProposal ensures that node will block proposal when it does not
@@ -414,9 +382,7 @@ func TestBlockProposal(t *testing.T) {
 	n.Campaign(context.TODO())
 	select {
 	case err := <-errc:
-		if err != nil {
-			t.Errorf("err = %v, want %v", err, nil)
-		}
+		require.NoError(t, err)
 	case <-time.After(10 * time.Second):
 		t.Errorf("blocking proposal, want unblocking")
 	}
@@ -458,16 +424,11 @@ func TestNodeProposeWaitDropped(t *testing.T) {
 	proposalTimeout := time.Millisecond * 100
 	ctx, cancel := context.WithTimeout(context.Background(), proposalTimeout)
 	// propose with cancel should be cancelled earyly if dropped
-	err := n.Propose(ctx, droppingMsg)
-	if err != ErrProposalDropped {
-		t.Errorf("should drop proposal : %v", err)
-	}
+	require.Equal(t, ErrProposalDropped, n.Propose(ctx, droppingMsg))
 	cancel()
 
 	n.Stop()
-	if len(msgs) != 0 {
-		t.Fatalf("len(msgs) = %d, want %d", len(msgs), 0)
-	}
+	require.Zero(t, len(msgs))
 }
 
 // TestNodeTick ensures that node.Tick() will increase the
@@ -486,9 +447,7 @@ func TestNodeTick(t *testing.T) {
 	}
 
 	n.Stop()
-	if r.electionElapsed != elapsed+1 {
-		t.Errorf("elapsed = %d, want %d", r.electionElapsed, elapsed+1)
-	}
+	require.Equal(t, elapsed+1, r.electionElapsed)
 }
 
 // TestNodeStop ensures that node.Stop() blocks until the node has stopped
@@ -513,15 +472,10 @@ func TestNodeStop(t *testing.T) {
 	}
 
 	emptyStatus := Status{}
-
-	if reflect.DeepEqual(status, emptyStatus) {
-		t.Errorf("status = %v, want not empty", status)
-	}
+	require.NotEqual(t, emptyStatus, status)
 	// Further status should return be empty, the node is stopped.
 	status = n.Status()
-	if !reflect.DeepEqual(status, emptyStatus) {
-		t.Errorf("status = %v, want empty", status)
-	}
+	require.Equal(t, emptyStatus, status)
 	// Subsequent Stops should have no effect.
 	n.Stop()
 }
@@ -532,9 +486,8 @@ func TestNodeStop(t *testing.T) {
 func TestNodeStart(t *testing.T) {
 	cc := raftpb.ConfChange{Type: raftpb.ConfChangeAddNode, NodeID: 1}
 	ccdata, err := cc.Marshal()
-	if err != nil {
-		t.Fatalf("unexpected marshal error: %v", err)
-	}
+	require.NoError(t, err)
+
 	wants := []Ready{
 		{
 			HardState: raftpb.HardState{Term: 1, Commit: 1, Vote: 0},
@@ -580,10 +533,7 @@ func TestNodeStart(t *testing.T) {
 		storage.Append(rd.Entries)
 		n.Advance()
 	}
-
-	if err := n.Campaign(ctx); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, n.Campaign(ctx))
 
 	{
 		rd := <-n.Ready()
@@ -594,18 +544,14 @@ func TestNodeStart(t *testing.T) {
 	n.Propose(ctx, []byte("foo"))
 	{
 		rd := <-n.Ready()
-		if !reflect.DeepEqual(rd, wants[1]) {
-			t.Errorf("#2: rd = %+v,\n             w   %+v", rd, wants[1])
-		}
+		require.Equal(t, wants[1], rd)
 		storage.Append(rd.Entries)
 		n.Advance()
 	}
 
 	{
 		rd := <-n.Ready()
-		if !reflect.DeepEqual(rd, wants[2]) {
-			t.Errorf("#3: rd = %+v,\n             w   %+v", rd, wants[2])
-		}
+		require.Equal(t, wants[2], rd)
 		storage.Append(rd.Entries)
 		n.Advance()
 	}
@@ -646,9 +592,7 @@ func TestNodeRestart(t *testing.T) {
 	}
 	n := RestartNode(c)
 	defer n.Stop()
-	if g := <-n.Ready(); !reflect.DeepEqual(g, want) {
-		t.Errorf("g = %+v,\n             w   %+v", g, want)
-	}
+	require.Equal(t, want, <-n.Ready())
 	n.Advance()
 
 	select {
@@ -696,11 +640,8 @@ func TestNodeRestartFromSnapshot(t *testing.T) {
 	}
 	n := RestartNode(c)
 	defer n.Stop()
-	if g := <-n.Ready(); !reflect.DeepEqual(g, want) {
-		t.Errorf("g = %+v,\n             w   %+v", g, want)
-	} else {
-		n.Advance()
-	}
+	require.Equal(t, want, <-n.Ready())
+	n.Advance()
 
 	select {
 	case rd := <-n.Ready():
@@ -749,9 +690,9 @@ func TestSoftStateEqual(t *testing.T) {
 		{&SoftState{RaftState: StateLeader}, false},
 	}
 	for i, tt := range tests {
-		if g := tt.st.equal(&SoftState{}); g != tt.we {
-			t.Errorf("#%d, equal = %v, want %v", i, g, tt.we)
-		}
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			require.Equal(t, tt.we, tt.st.equal(&SoftState{}))
+		})
 	}
 }
 
@@ -767,9 +708,9 @@ func TestIsHardStateEqual(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		if isHardStateEqual(tt.st, emptyState) != tt.we {
-			t.Errorf("#%d, equal = %v, want %v", i, isHardStateEqual(tt.st, emptyState), tt.we)
-		}
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			require.Equal(t, tt.we, isHardStateEqual(tt.st, emptyState))
+		})
 	}
 }
 
@@ -802,15 +743,13 @@ func TestNodeProposeAddLearnerNode(t *testing.T) {
 					var cc raftpb.ConfChange
 					cc.Unmarshal(ent.Data)
 					state := n.ApplyConfChange(cc)
-					if len(state.Learners) == 0 ||
-						state.Learners[0] != cc.NodeID ||
-						cc.NodeID != 2 {
-						t.Errorf("apply conf change should return new added learner: %v", state.String())
-					}
+					require.Condition(t, func() (success bool) {
+						return !(len(state.Learners) == 0 ||
+							state.Learners[0] != cc.NodeID ||
+							cc.NodeID != 2)
+					}, "apply conf change should return new added learner: %v", state.String())
 
-					if len(state.Voters) != 1 {
-						t.Errorf("add learner should not change the nodes: %v", state.String())
-					}
+					require.Equal(t, 1, len(state.Voters))
 					t.Logf("apply raft conf %v changed to: %v", cc, state.String())
 					applyConfChan <- struct{}{}
 				}
@@ -841,9 +780,7 @@ func TestAppendPagination(t *testing.T) {
 			for _, e := range m.Entries {
 				size += len(e.Data)
 			}
-			if size > maxSizePerMsg {
-				t.Errorf("sent MsgApp that is too large: %d bytes", size)
-			}
+			require.False(t, size > maxSizePerMsg, "sent MsgApp that is too large: %d bytes", size)
 			if size > maxSizePerMsg/2 {
 				seenFullMessage = true
 			}
@@ -865,9 +802,7 @@ func TestAppendPagination(t *testing.T) {
 	// After the partition recovers, tick the clock to wake everything
 	// back up and send the messages.
 	n.send(raftpb.Message{From: 1, To: 1, Type: raftpb.MsgBeat})
-	if !seenFullMessage {
-		t.Error("didn't see any messages more than half the max size; something is wrong with this test")
-	}
+	require.True(t, seenFullMessage)
 }
 
 func TestCommitPagination(t *testing.T) {
@@ -882,38 +817,28 @@ func TestCommitPagination(t *testing.T) {
 	s.Append(rd.Entries)
 	n.Advance()
 	rd = readyWithTimeout(n)
-	if len(rd.CommittedEntries) != 1 {
-		t.Fatalf("expected 1 (empty) entry, got %d", len(rd.CommittedEntries))
-	}
+	require.Equal(t, 1, len(rd.CommittedEntries))
 	s.Append(rd.Entries)
 	n.Advance()
 
 	blob := []byte(strings.Repeat("a", 1000))
 	for i := 0; i < 3; i++ {
-		if err := n.Propose(ctx, blob); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, n.Propose(ctx, blob))
 	}
 
 	// First the three proposals have to be appended.
 	rd = readyWithTimeout(n)
-	if len(rd.Entries) != 3 {
-		t.Fatal("expected to see three entries")
-	}
+	require.Equal(t, 3, len(rd.Entries))
 	s.Append(rd.Entries)
 	n.Advance()
 
 	// The 3 proposals will commit in two batches.
 	rd = readyWithTimeout(n)
-	if len(rd.CommittedEntries) != 2 {
-		t.Fatalf("expected 2 entries in first batch, got %d", len(rd.CommittedEntries))
-	}
+	require.Equal(t, 2, len(rd.CommittedEntries))
 	s.Append(rd.Entries)
 	n.Advance()
 	rd = readyWithTimeout(n)
-	if len(rd.CommittedEntries) != 1 {
-		t.Fatalf("expected 1 entry in second batch, got %d", len(rd.CommittedEntries))
-	}
+	require.Equal(t, 1, len(rd.CommittedEntries))
 	s.Append(rd.Entries)
 	n.Advance()
 }
@@ -974,18 +899,14 @@ func TestNodeCommitPaginationAfterRestart(t *testing.T) {
 	cfg.MaxSizePerMsg = size - uint64(s.ents[len(s.ents)-1].Size()) - 1
 
 	rn, err := NewRawNode(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	n := newNode(rn)
 	go n.run()
 	defer n.Stop()
 
 	rd := readyWithTimeout(&n)
-	if !IsEmptyHardState(rd.HardState) && rd.HardState.Commit < persistedHardState.Commit {
-		t.Errorf("HardState regressed: Commit %d -> %d\nCommitting:\n%+v",
-			persistedHardState.Commit, rd.HardState.Commit,
-			DescribeEntries(rd.CommittedEntries, func(data []byte) string { return fmt.Sprintf("%q", data) }),
-		)
-	}
+	require.False(t, !IsEmptyHardState(rd.HardState) && rd.HardState.Commit < persistedHardState.Commit,
+		"HardState regressed: Commit %d -> %d\nCommitting:\n%+v",
+		persistedHardState.Commit, rd.HardState.Commit,
+		DescribeEntries(rd.CommittedEntries, func(data []byte) string { return fmt.Sprintf("%q", data) }))
 }
